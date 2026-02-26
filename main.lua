@@ -222,6 +222,81 @@ local save_project = ya.sync(function(state, idx, desc)
     end
 end)
 
+local _mark_saved_last = ya.sync(function(state)
+    if not state.reload or type(state.reload.save_stamp_file) ~= "string" or state.reload.save_stamp_file == "" then
+        return
+    end
+
+    local f = io.open(state.reload.save_stamp_file, "w")
+    if not f then
+        return
+    end
+
+    local yazi_id = os.getenv("YAZI_ID")
+    if yazi_id and yazi_id ~= "" then
+        f:write(string.format("%s:saved-last", yazi_id))
+    else
+        f:write("saved-last")
+    end
+    io.close(f)
+end)
+
+local save_last_project = ya.sync(function(state)
+    local projects = _get_projects()
+    local current_project = _get_current_project()
+    projects.last = current_project
+
+    _save_projects(projects)
+    _mark_saved_last()
+
+    if state.event.save.enable then
+        pcall(ps.pub_to, 0, state.event.save.name, current_project)
+    end
+
+    if state.notify.enable then
+        _notify("Last project saved")
+    end
+end)
+
+local _save_last_if_changed = ya.sync(function(state)
+    if not state.autosave or not state.autosave.enable then
+        return
+    end
+
+    if not cx then
+        return
+    end
+
+    local project = _get_current_project()
+    local encoded = state.json.encode(project)
+    if state.autosave.last_encoded == encoded then
+        return
+    end
+
+    local projects = _get_projects()
+    projects.last = project
+    _save_projects(projects)
+    state.autosave.last_encoded = encoded
+end)
+
+local _start_autosave = ya.sync(function(state)
+    if not state.autosave or not state.autosave.enable then
+        return
+    end
+
+    local interval = state.autosave.interval_secs
+    if type(interval) ~= "number" or interval <= 0 then
+        interval = 0.5
+    end
+
+    ya.async(function()
+        while true do
+            ya.sleep(interval)
+            _save_last_if_changed()
+        end
+    end)
+end)
+
 local load_project = ya.sync(function(state, project, desc)
     -- TODO: add more tab properties to restore
 
@@ -264,6 +339,44 @@ local load_project = ya.sync(function(state, project, desc)
     end
 end)
 
+local _consume_pending_load_last = ya.sync(function(state)
+    if not state.reload or type(state.reload.action_file) ~= "string" or state.reload.action_file == "" then
+        return false
+    end
+
+    local f = io.open(state.reload.action_file, "r")
+    if not f then
+        return false
+    end
+
+    local pending = f:read("*a")
+    io.close(f)
+
+    if type(pending) ~= "string" then
+        return false
+    end
+
+    pending = pending:match("^%s*(.-)%s*$")
+
+    if pending == "projects-load-last" then
+        os.remove(state.reload.action_file)
+        return true
+    end
+
+    local yazi_id = os.getenv("YAZI_ID")
+    if not yazi_id or yazi_id == "" then
+        return false
+    end
+
+    local expected = string.format("%s:projects-load-last", yazi_id)
+    if pending ~= expected then
+        return false
+    end
+
+    os.remove(state.reload.action_file)
+    return true
+end)
+
 local _load_projects = ya.sync(function(state)
     if state.save.method == "yazi" then
         ps.sub_remote(state.save.yazi_load_event, function(body)
@@ -281,7 +394,8 @@ local _load_projects = ya.sync(function(state)
         state.projects = _get_default_projects()
     end
 
-    if state.last.load_after_start then
+    local should_load_last = state.last.load_after_start or _consume_pending_load_last()
+    if should_load_last then
         local last_project = _get_projects().last
         if last_project then
             load_project(last_project)
@@ -528,6 +642,31 @@ local _load_config = ya.sync(function(state, opts)
         end)
     end
 
+    state.reload = {
+        action_file = "",
+        save_stamp_file = "",
+    }
+    if type(opts.reload) == "table" and type(opts.reload.action_file) == "string" then
+        state.reload.action_file = opts.reload.action_file
+    end
+    if type(opts.reload) == "table" and type(opts.reload.save_stamp_file) == "string" then
+        state.reload.save_stamp_file = opts.reload.save_stamp_file
+    end
+
+    state.autosave = {
+        enable = true,
+        interval_secs = 0.5,
+        last_encoded = nil,
+    }
+    if type(opts.autosave) == "table" then
+        if type(opts.autosave.enable) == "boolean" then
+            state.autosave.enable = opts.autosave.enable
+        end
+        if type(opts.autosave.interval_secs) == "number" then
+            state.autosave.interval_secs = opts.autosave.interval_secs
+        end
+    end
+
     state.merge = {
         event = "projects-merge",
         quit_after_merge = false,
@@ -569,6 +708,7 @@ return {
         _load_config(opts)
         _load_projects()
         _merge_event()
+        _start_autosave()
     end,
     entry = function(_, job)
         local action = job.args[1]
@@ -584,6 +724,17 @@ return {
         if action == "merge" then
             local opt = job.args[2]
             merge_project(opt)
+            return
+        end
+
+        if action == "save_last" then
+            save_last_project()
+            return
+        end
+
+        if action == "save_last_and_quit" then
+            save_last_project()
+            ya.emit("quit", {})
             return
         end
 
