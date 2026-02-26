@@ -340,6 +340,14 @@ local load_project = ya.sync(function(state, project, desc)
 end)
 
 local _consume_pending_load_last = ya.sync(function(state)
+    local force_load = os.getenv("YAZI_THEME_RELOAD")
+    if force_load == "1" or force_load == "true" then
+        if state.reload and type(state.reload.action_file) == "string" and state.reload.action_file ~= "" then
+            os.remove(state.reload.action_file)
+        end
+        return true
+    end
+
     if not state.reload or type(state.reload.action_file) ~= "string" or state.reload.action_file == "" then
         return false
     end
